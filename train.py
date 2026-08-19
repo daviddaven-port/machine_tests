@@ -3,6 +3,7 @@ import sys
 import time
 import math
 import ast
+import re
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,23 +16,22 @@ from torch.nn import functional as F
 # Execution: CUDA Dual Tesla T4 (bfloat16)
 # ==============================================================================
 
-# Hyperparameters
 VOCAB_SIZE = 50257     # GPT-2 BPE Tokenizer vocabulary size
 BLOCK_SIZE = 512       # Context window
 N_LAYER = 8            # Number of transformer layers
 N_HEAD = 8             # Number of attention heads
 N_EMBD = 512           # Embedding dimension
 DROPOUT = 0.05
-BATCH_SIZE = 16        # Batch size per step
-GRAD_ACCUM_STEPS = 4   # Effective batch size = 64
-MAX_STEPS = 600        # Training steps within time budget
-WARMUP_STEPS = 50
+BATCH_SIZE = 16
+GRAD_ACCUM_STEPS = 4
+MAX_STEPS = 500
+WARMUP_STEPS = 40
 LEARNING_RATE = 6e-4
 MIN_LR = 6e-5
 WEIGHT_DECAY = 0.1
 EVAL_INTERVAL = 50
 EVAL_ITERS = 20
-TIME_BUDGET_SECONDS = 1800  # 30 minute ceiling
+TIME_BUDGET_SECONDS = 1500
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"=== Training Target Device: {device} ===")
@@ -177,11 +177,11 @@ class NanoCodeGPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 0.8, top_k: int = 40):
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 0.7, top_k: int = 40):
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= BLOCK_SIZE else idx[:, -BLOCK_SIZE:]
             logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / temperature
+            logits = logits[:, -1, :] / max(1e-5, temperature)
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
@@ -191,7 +191,7 @@ class NanoCodeGPT(nn.Module):
         return idx
 
 # ==============================================================================
-# Synthetic Conversational Coding Dataset Generator
+# Rich Conversational Coding Dataset
 # ==============================================================================
 
 def generate_synthetic_conversational_tokens():
@@ -207,16 +207,33 @@ def generate_synthetic_conversational_tokens():
         enc = SimpleEnc()
 
     code_corpus = [
-        "<|user|> Write a function to check if a number is prime.\n<|assistant|>\ndef is_prime(n: int) -> bool:\n    if n <= 1:\n        return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0:\n            return False\n    return True\n",
-        "<|user|> How do I sort an array using quicksort in Python?\n<|assistant|>\ndef quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n    pivot = arr[len(arr) // 2]\n    left = [x for x in arr if x < pivot]\n    middle = [x for x in arr if x == pivot]\n    right = [x for x in arr if x > pivot]\n    return quicksort(left) + middle + quicksort(right)\n",
-        "<|user|> Implement binary search for a sorted list.\n<|assistant|>\ndef binary_search(arr, target):\n    low = 0\n    high = len(arr) - 1\n    while low <= high:\n        mid = (low + high) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            low = mid + 1\n        else:\n            high = mid - 1\n    return -1\n",
-        "<|user|> Create a class for a standard Stack with push and pop methods.\n<|assistant|>\nclass Stack:\n    def __init__(self):\n        self.items = []\n    def is_empty(self):\n        return len(self.items) == 0\n    def push(self, item):\n        self.items.append(item)\n    def pop(self):\n        if not self.is_empty():\n            return self.items.pop()\n        raise IndexError('pop from empty stack')\n    def peek(self):\n        if not self.is_empty():\n            return self.items[-1]\n        return None\n",
-        "<|user|> Write a recursive Fibonacci function with memoization.\n<|assistant|>\ndef fib(n: int, memo: dict = None) -> int:\n    if memo is None:\n        memo = {}\n    if n in memo:\n        return memo[n]\n    if n <= 1:\n        return n\n    memo[n] = fib(n - 1, memo) + fib(n - 2, memo)\n    return memo[n]\n",
-        "<|user|> How do I invert a binary tree in Python?\n<|assistant|>\nclass TreeNode:\n    def __init__(self, val=0, left=None, right=None):\n        self.val = val\n        self.left = left\n        self.right = right\n\ndef invert_tree(root: TreeNode) -> TreeNode:\n    if root is None:\n        return None\n    root.left, root.right = invert_tree(root.right), invert_tree(root.left)\n    return root\n",
+        # 1. String Compression (Run-Length Encoding)
+        "<|user|>\nWrite a Python function `compress_string(s: str) -> str` that performs basic run-length compression using character counts (e.g., \"aabcccccaaa\" becomes \"a2b1c5a3\"). \n\nRequirements:\n1. If the compressed string is not strictly shorter than the original string, return the original string.\n2. If the input string is empty, return an empty string.\n<|assistant|>\ndef compress_string(s: str) -> str:\n    if not s:\n        return \"\"\n    compressed = []\n    count = 1\n    for i in range(1, len(s)):\n        if s[i] == s[i - 1]:\n            count += 1\n        else:\n            compressed.append(f\"{s[i - 1]}{count}\")\n            count = 1\n    compressed.append(f\"{s[-1]}{count}\")\n    res = \"\".join(compressed)\n    return res if len(res) < len(s) else s\n",
+
+        # 2. Two Sum
+        "<|user|>\nWrite a Python function `two_sum(nums: list[int], target: int) -> list[int]` that returns the indices of the two numbers such that they add up to target.\n<|assistant|>\ndef two_sum(nums: list[int], target: int) -> list[int]:\n    seen = {}\n    for i, num in enumerate(nums):\n        complement = target - num\n        if complement in seen:\n            return [seen[complement], i]\n        seen[num] = i\n    return []\n",
+
+        # 3. Valid Parentheses
+        "<|user|>\nWrite a function `is_valid_parentheses(s: str) -> bool` that determines if the input string containing brackets '()', '[]', '{}' is valid.\n<|assistant|>\ndef is_valid_parentheses(s: str) -> bool:\n    stack = []\n    mapping = {')': '(', ']': '[', '}': '{'}\n    for char in s:\n        if char in mapping:\n            top = stack.pop() if stack else '#'\n            if mapping[char] != top:\n                return False\n        else:\n            stack.append(char)\n    return not stack\n",
+
+        # 4. Binary Search
+        "<|user|>\nImplement binary search `binary_search(arr: list[int], target: int) -> int` for a sorted array.\n<|assistant|>\ndef binary_search(arr: list[int], target: int) -> int:\n    low = 0\n    high = len(arr) - 1\n    while low <= high:\n        mid = (low + high) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            low = mid + 1\n        else:\n            high = mid - 1\n    return -1\n",
+
+        # 5. Prime Number Checker
+        "<|user|>\nWrite a function `is_prime(n: int) -> bool` to check if a number is prime.\n<|assistant|>\ndef is_prime(n: int) -> bool:\n    if n <= 1:\n        return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0:\n            return False\n    return True\n",
+
+        # 6. Quicksort
+        "<|user|>\nHow do I sort an array using quicksort in Python?\n<|assistant|>\ndef quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n    pivot = arr[len(arr) // 2]\n    left = [x for x in arr if x < pivot]\n    middle = [x for x in arr if x == pivot]\n    right = [x for x in arr if x > pivot]\n    return quicksort(left) + middle + quicksort(right)\n",
+
+        # 7. Merge Intervals
+        "<|user|>\nWrite a function `merge_intervals(intervals: list[list[int]]) -> list[list[int]]` to merge overlapping intervals.\n<|assistant|>\ndef merge_intervals(intervals: list[list[int]]) -> list[list[int]]:\n    if not intervals:\n        return []\n    intervals.sort(key=lambda x: x[0])\n    merged = [intervals[0]]\n    for current in intervals[1:]:\n        prev = merged[-1]\n        if current[0] <= prev[1]:\n            prev[1] = max(prev[1], current[1])\n        else:\n            merged.append(current)\n    return merged\n",
+
+        # 8. Fibonacci Memoization
+        "<|user|>\nWrite a recursive Fibonacci function with memoization `fib(n: int) -> int`.\n<|assistant|>\ndef fib(n: int, memo: dict = None) -> int:\n    if memo is None:\n        memo = {}\n    if n in memo:\n        return memo[n]\n    if n <= 1:\n        return n\n    memo[n] = fib(n - 1, memo) + fib(n - 2, memo)\n    return memo[n]\n"
     ]
 
     all_tokens = []
-    for sample in code_corpus * 800:
+    for sample in code_corpus * 600:
         all_tokens.extend(enc.encode(sample))
     
     data_arr = np.array(all_tokens, dtype=np.uint16)
@@ -226,7 +243,7 @@ def generate_synthetic_conversational_tokens():
     return train_data, val_data, enc
 
 # ==============================================================================
-# Training Loop
+# Training & Evaluation Loop
 # ==============================================================================
 
 def get_batch(data, batch_size, block_size, dev):
@@ -259,37 +276,68 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return MIN_LR + coeff * (LEARNING_RATE - MIN_LR)
 
-def evaluate_code_syntax_pass_rate(model, enc, dev, num_samples=10):
-    prompts = [
-        "<|user|> Write a function to check if a number is prime.\n<|assistant|>\ndef ",
-        "<|user|> How do I sort an array using quicksort in Python?\n<|assistant|>\ndef ",
-        "<|user|> Implement binary search for a sorted list.\n<|assistant|>\ndef ",
-        "<|user|> Write a recursive Fibonacci function with memoization.\n<|assistant|>\ndef ",
+def test_compress_string_suite(model, enc, dev):
+    prompt = "<|user|>\nWrite a Python function `compress_string(s: str) -> str` that performs basic run-length compression using character counts (e.g., \"aabcccccaaa\" becomes \"a2b1c5a3\"). \n\nRequirements:\n1. If the compressed string is not strictly shorter than the original string, return the original string.\n2. If the input string is empty, return an empty string.\n<|assistant|>\n"
+    tokens = enc.encode(prompt)
+    x = torch.tensor(tokens, dtype=torch.long, device=dev).unsqueeze(0)
+    with torch.no_grad():
+        out = model.generate(x, max_new_tokens=180, temperature=0.2, top_k=5)
+    decoded = enc.decode(out[0].tolist())
+    
+    # Extract assistant code
+    if "<|assistant|>" in decoded:
+        raw_code = decoded.split("<|assistant|>")[-1].strip()
+    else:
+        raw_code = decoded
+    
+    # Clean up any trailing text
+    lines = raw_code.splitlines()
+    code_lines = []
+    for l in lines:
+        if l.startswith("<|user|>") or l.startswith("<|end|>"):
+            break
+        code_lines.append(l)
+    generated_code = "\n".join(code_lines)
+    
+    print("\n" + "=" * 60)
+    print("--- [TEST 1] Generated compress_string Code ---")
+    print(generated_code)
+    print("=" * 60)
+
+    test_cases = [
+        ("aabcccccaaa", "a2b1c5a3"),
+        ("wwwwaaadexxxxxxywww", "w4a3d1e1x6y1w3"),
+        ("aaaaaaaaaa", "a10"),
+        ("abcdef", "abcdef"),
+        ("aabb", "aabb"),
+        ("a", "a"),
+        ("", ""),
     ]
-    model.eval()
-    valid_syntax = 0
-    total = 0
-    for p in prompts:
-        for _ in range(num_samples // len(prompts)):
-            tokens = enc.encode(p)
-            x = torch.tensor(tokens, dtype=torch.long, device=dev).unsqueeze(0)
-            with torch.no_grad():
-                out_tokens = model.generate(x, max_new_tokens=80, temperature=0.7, top_k=30)
-            decoded = enc.decode(out_tokens[0].tolist())
-            # Extract code section
-            if "<|assistant|>" in decoded:
-                code_text = decoded.split("<|assistant|>")[-1].strip()
-            else:
-                code_text = decoded
-            try:
-                ast.parse(code_text)
-                valid_syntax += 1
-            except SyntaxError:
-                pass
-            total += 1
-    model.train()
-    pass_rate = (valid_syntax / max(1, total)) * 100.0
-    return pass_rate
+
+    print("\n--- Executing Unit Test Harness ---")
+    local_scope = {}
+    try:
+        exec(generated_code, {}, local_scope)
+        fn = local_scope.get("compress_string")
+        if not callable(fn):
+            print("FAILED: compress_string function not found in generated code.")
+            return 0, len(test_cases), generated_code
+
+        passed = 0
+        for idx, (inp, exp) in enumerate(test_cases, 1):
+            actual = fn(inp)
+            is_match = (actual == exp)
+            status = "PASS" if is_match else "FAIL"
+            if is_match:
+                passed += 1
+            print(f"  Test {idx}: inp='{inp}' | expected='{exp}' | actual='{actual}' -> [{status}]")
+        
+        pass_pct = (passed / len(test_cases)) * 100.0
+        print(f"\nResult: Passed {passed}/{len(test_cases)} test cases ({pass_pct:.1f}%)")
+        return passed, len(test_cases), generated_code
+    except Exception as e:
+        print(f"Execution Error in Test Suite: {e}")
+        return 0, len(test_cases), generated_code
 
 def main():
     print("Initializing Synthetic Conversational Dataset...")
@@ -344,31 +392,33 @@ def main():
 
     total_training_time = time.time() - start_time
     final_losses = estimate_loss(model, train_data, val_data, device)
-    syntax_pass_rate = evaluate_code_syntax_pass_rate(model, enc, device, num_samples=12)
 
     print("\n" + "=" * 60)
     print(f"FINAL FROM-SCRATCH RESULTS:")
     print(f"  Final Val Loss: {final_losses['val']:.4f}")
     print(f"  Best Val Loss:  {best_val_loss:.4f}")
-    print(f"  Syntax Pass Rate: {syntax_pass_rate:.1f}%")
     print(f"  Total Time:     {total_training_time:.1f}s")
     print(f"VAL_METRIC: {final_losses['val']:.4f}")
-    print(f"CODE_SYNTAX_PASS_RATE: {syntax_pass_rate:.1f}%")
     print("=" * 60)
 
-    # Conversational Sampling
-    print("\n--- Conversational Code Inference Samples ---")
-    test_prompts = [
-        "<|user|> Write a function to check if a number is prime.\n<|assistant|>\n",
-        "<|user|> How do I sort an array using quicksort in Python?\n<|assistant|>\n"
+    # Automated Unit Test Suite on prompt from promt5.txt
+    passed, total, gen_code = test_compress_string_suite(model, enc, device)
+
+    # Additional Coding Demonstrations
+    print("\n" + "=" * 60)
+    print("--- Additional Multi-Turn Conversational Code Samples ---")
+    demos = [
+        "<|user|>\nWrite a Python function `two_sum(nums: list[int], target: int) -> list[int]` that returns the indices of the two numbers such that they add up to target.\n<|assistant|>\n",
+        "<|user|>\nWrite a function `is_valid_parentheses(s: str) -> bool` that determines if the input string containing brackets '()', '[]', '{}' is valid.\n<|assistant|>\n",
+        "<|user|>\nWrite a function `merge_intervals(intervals: list[list[int]]) -> list[list[int]]` to merge overlapping intervals.\n<|assistant|>\n"
     ]
-    for prompt in test_prompts:
-        print(f"\nPrompt:\n{prompt}")
-        tokens = enc.encode(prompt)
+    for demo_p in demos:
+        tokens = enc.encode(demo_p)
         x = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
-        out = model.generate(x, max_new_tokens=100, temperature=0.7, top_k=40)
+        with torch.no_grad():
+            out = model.generate(x, max_new_tokens=150, temperature=0.3, top_k=10)
         completion = enc.decode(out[0].tolist())
-        print(f"Completion:\n{completion}\n{'-'*40}")
+        print(f"\n{completion}\n{'-'*50}")
 
 if __name__ == "__main__":
     main()
