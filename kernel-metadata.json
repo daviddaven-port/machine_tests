@@ -1,0 +1,12 @@
+{
+  "id": "r1two3four5/nanogpt-research-autoloop",
+  "title": "nanogpt-research-autoloop",
+  "code_file": "train.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "true",
+  "enable_internet": "true",
+  "accelerator": "tpuV38"
+}

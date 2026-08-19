@@ -1,0 +1,7 @@
+.kaggle/
+*.token
+*.key
+*.json
+!kernel-metadata.json
+.env
+*.log
