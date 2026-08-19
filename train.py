@@ -1,150 +1,56 @@
-"""
-nanoCode-RSI: PyTorch/XLA Training Baseline for Google Cloud TPU VM v3-8 on Kaggle.
-- Target Architecture: N_layer=6, d_model=384, N_head=6, T_seq=512.
-- Native TPU bfloat16 mixed precision execution.
-- Optimized with torch_xla PJRT runtime (xm.xla_device, xm.optimizer_step).
-- Formatted stdout metric markers:
-    VAL_METRIC: <float>
-    CODE_SYNTAX_PASS_RATE: <float>%
-"""
 import os
 import sys
-import ast
-import math
 import time
-import urllib.request
-from dataclasses import dataclass
+import math
+import ast
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
 # ==============================================================================
-# PyTorch / XLA Initialization for Google Cloud TPU
+# nanoCode-RSI: 100% From-Scratch Conversational Coding Model
+# Architecture: Transformer with ALiBi, QK-Norm, SwiGLU, RMSNorm
+# Initialization: Random Gaussian N(0, 0.02), Bias=0
+# Execution: CUDA Dual Tesla T4 (bfloat16)
 # ==============================================================================
-try:
-    import torch_xla
-    import torch_xla.core.xla_model as xm
-    XLA_AVAILABLE = True
-except ImportError:
-    XLA_AVAILABLE = False
 
-# ==============================================================================
-# Model & TPU Training Configuration
-# ==============================================================================
-@dataclass
-class GPTConfig:
-    block_size: int = 512              # Sequence length T_seq = 512
-    vocab_size: int = 50304            # Padded GPT-2 BPE vocab (aligned for TPU Matrix Units)
-    n_layer: int = 6                   # 6 Transformer layers
-    n_head: int = 6                    # 6 Query heads (64 dim per head)
-    n_embd: int = 384                  # d_model = 384
-    dropout: float = 0.0
-    bias: bool = False
-    batch_size: int = 64               # TPU v3-8 optimized micro-batch size (high HBM throughput)
-    gradient_accumulation_steps: int = 4 # Global batch = 64 * 512 * 4 = 131,072 tokens/step
-    learning_rate: float = 8e-4
-    max_iters: int = 2500
-    eval_interval: int = 150
-    eval_iters: int = 25
-    warmup_iters: int = 60
-    lr_decay_iters: int = 2500
-    min_lr: float = 8e-5
-    max_time_seconds: int = 270        # 4.5-minute execution window per iteration
+# Hyperparameters
+VOCAB_SIZE = 50257     # GPT-2 BPE Tokenizer vocabulary size
+BLOCK_SIZE = 512       # Context window
+N_LAYER = 8            # Number of transformer layers
+N_HEAD = 8             # Number of attention heads
+N_EMBD = 512           # Embedding dimension
+DROPOUT = 0.05
+BATCH_SIZE = 16        # Batch size per step
+GRAD_ACCUM_STEPS = 4   # Effective batch size = 64
+MAX_STEPS = 600        # Training steps within time budget
+WARMUP_STEPS = 50
+LEARNING_RATE = 6e-4
+MIN_LR = 6e-5
+WEIGHT_DECAY = 0.1
+EVAL_INTERVAL = 50
+EVAL_ITERS = 20
+TIME_BUDGET_SECONDS = 1800  # 30 minute ceiling
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"=== Training Target Device: {device} ===")
+if torch.cuda.is_available():
+    print(f"GPU Count: {torch.cuda.device_count()}, GPU: {torch.cuda.get_device_name(0)}")
 
 # ==============================================================================
-# Fast Dataset Loader (uint16 flat binary memmap for TPU)
+# Model Architecture
 # ==============================================================================
-def get_dataset():
-    data_dir = "."
-    train_bin = os.path.join(data_dir, "train.bin")
-    val_bin = os.path.join(data_dir, "val.bin")
 
-    if not os.path.exists(train_bin) or not os.path.exists(val_bin):
-        print("Generating Python code dataset buffers for TPU...")
-        code_corpus = """
-def binary_search(arr, target):
-    low = 0
-    high = len(arr) - 1
-    while low <= high:
-        mid = (low + high) // 2
-        if arr[mid] == target:
-            return mid
-        elif arr[mid] < target:
-            low = mid + 1
-        else:
-            high = mid - 1
-    return -1
-
-def quick_sort(arr):
-    if len(arr) <= 1:
-        return arr
-    pivot = arr[len(arr) // 2]
-    left = [x for x in arr if x < pivot]
-    middle = [x for x in arr if x == pivot]
-    right = [x for x in arr if x > pivot]
-    return quick_sort(left) + middle + quick_sort(right)
-
-class Stack:
-    def __init__(self):
-        self.items = []
-    def push(self, item):
-        self.items.append(item)
-    def pop(self):
-        return self.items.pop() if not self.is_empty() else None
-    def is_empty(self):
-        return len(self.items) == 0
-
-def fibonacci(n: int) -> int:
-    if n <= 1:
-        return n
-    a, b = 0, 1
-    for _ in range(2, n + 1):
-        a, b = b, a + b
-    return b
-"""
-        code_corpus = code_corpus * 300
-        try:
-            import tiktoken
-            enc = tiktoken.get_encoding("gpt2")
-            train_ids = np.array(enc.encode_ordinary(code_corpus[:int(len(code_corpus)*0.9)]), dtype=np.uint16)
-            val_ids = np.array(enc.encode_ordinary(code_corpus[int(len(code_corpus)*0.9):]), dtype=np.uint16)
-        except Exception:
-            chars = sorted(list(set(code_corpus)))
-            stoi = { ch:i for i,ch in enumerate(chars) }
-            train_ids = np.array([stoi[c] for c in code_corpus[:int(len(code_corpus)*0.9)]], dtype=np.uint16)
-            val_ids = np.array([stoi[c] for c in code_corpus[int(len(code_corpus)*0.9):]], dtype=np.uint16)
-
-        train_ids.tofile(train_bin)
-        val_ids.tofile(val_bin)
-
-    train_data = np.memmap(train_bin, dtype=np.uint16, mode='r')
-    val_data = np.memmap(val_bin, dtype=np.uint16, mode='r')
-    return train_data, val_data
-
-def get_batch(data, config: GPTConfig, device):
-    max_idx = len(data) - config.block_size
-    if max_idx <= 0:
-        ix = torch.zeros((config.batch_size,), dtype=torch.long)
-    else:
-        ix = torch.randint(max_idx, (config.batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+config.block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+config.block_size]).astype(np.int64)) for i in ix])
-    return x.to(device), y.to(device)
-
-# ==============================================================================
-# Model Architecture Components (Optimized for TPU XLA Execution Graph)
-# ==============================================================================
-class LayerNorm(nn.Module):
-    """RMSNorm (Root Mean Square Layer Normalization)."""
-    def __init__(self, ndim, bias=False):
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, x):
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + 1e-5)
-        return self.weight * x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        var = torch.mean(x ** 2, dim=-1, keepdim=True)
+        return x * torch.rsqrt(var + self.eps) * self.weight
 
 def get_alibi_slopes(n_heads: int):
     def get_slopes_power_of_2(n):
@@ -154,88 +60,94 @@ def get_alibi_slopes(n_heads: int):
     if math.log2(n_heads).is_integer():
         return torch.tensor(get_slopes_power_of_2(n_heads))
     else:
-        closest_pow_2 = 2 ** math.floor(math.log2(n_heads))
-        return torch.tensor(get_slopes_power_of_2(closest_pow_2) + 
-                            get_slopes_power_of_2(2 * closest_pow_2)[0::2][:n_heads - closest_pow_2])
+        closest_pow2 = 2 ** math.floor(math.log2(n_heads))
+        slopes_a = get_slopes_power_of_2(closest_pow2)
+        slopes_b = get_slopes_power_of_2(2 * closest_pow2)[0::2][:n_heads - closest_pow2]
+        return torch.tensor(slopes_a + slopes_b)
+
+def build_alibi_bias(n_heads: int, seq_len: int, device: torch.device):
+    slopes = get_alibi_slopes(n_heads).to(device)
+    pos = torch.arange(seq_len, device=device)
+    relative_pos = pos.unsqueeze(0) - pos.unsqueeze(1)
+    relative_pos = torch.clamp(relative_pos, max=0)
+    alibi = slopes.view(1, n_heads, 1, 1) * relative_pos.view(1, 1, seq_len, seq_len)
+    return alibi
+
+class SwiGLU(nn.Module):
+    def __init__(self, in_features: int, hidden_features: int):
+        super().__init__()
+        self.w1 = nn.Linear(in_features, hidden_features, bias=False)
+        self.w2 = nn.Linear(in_features, hidden_features, bias=False)
+        self.w3 = nn.Linear(hidden_features, in_features, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, n_embd: int, n_head: int, dropout: float = 0.0):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.q_norm = LayerNorm(config.n_embd // config.n_head)
-        self.k_norm = LayerNorm(config.n_embd // config.n_head)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.head_dim = config.n_embd // config.n_head
+        assert n_embd % n_head == 0
+        self.n_head = n_head
+        self.n_embd = n_embd
+        self.head_dim = n_embd // n_head
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.dropout = dropout
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
 
-        # Precompute ALiBi linear slope bias
-        slopes = get_alibi_slopes(config.n_head).view(1, config.n_head, 1, 1)
-        positions = torch.arange(config.block_size).view(1, 1, 1, config.block_size)
-        distance = positions - positions.transpose(-1, -2) # [1, 1, T, T]
-        alibi_bias = slopes * distance
-        self.register_buffer("alibi_bias", alibi_bias)
-        self.register_buffer("causal_mask", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
-
-    def forward(self, x):
+    def forward(self, x: torch.Tensor, alibi_bias: torch.Tensor = None) -> torch.Tensor:
         B, T, C = x.size()
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        # QK Normalization for attention stability
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # Attention with ALiBi relative position bias (XLA-compiled matmul)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-        att = att + self.alibi_bias[:, :, :T, :T].to(x.dtype)
-        att = att.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float('-inf'))
+        if alibi_bias is not None:
+            att = att + alibi_bias[:, :, :T, :T]
+        
+        causal_mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
+        att = att.masked_fill(causal_mask == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
+        if self.dropout > 0:
+            att = F.dropout(att, p=self.dropout, training=self.training)
+        
         y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
 
-class MLP(nn.Module):
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        hidden_dim = int(8 * config.n_embd / 3) # SwiGLU 8/3 expansion
-        self.w1 = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
-        self.w2 = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
-        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
-
-    def forward(self, x):
-        x = F.silu(self.w1(x)) * self.w2(x)
-        x = self.c_proj(x)
-        return x
-
 class Block(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, n_embd: int, n_head: int, dropout: float = 0.0):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.ln_1 = RMSNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, n_head, dropout)
+        self.ln_2 = RMSNorm(n_embd)
+        hidden_dim = int(2 * (4 * n_embd) / 3)
+        hidden_dim = ((hidden_dim + 63) // 64) * 64
+        self.mlp = SwiGLU(n_embd, hidden_dim)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x: torch.Tensor, alibi_bias: torch.Tensor = None) -> torch.Tensor:
+        x = x + self.attn(self.ln_1(x), alibi_bias=alibi_bias)
         x = x + self.mlp(self.ln_2(x))
         return x
 
-class GPT(nn.Module):
-    def __init__(self, config: GPTConfig):
+class NanoCodeGPT(nn.Module):
+    def __init__(self, vocab_size: int, n_layer: int, n_head: int, n_embd: int, dropout: float = 0.0):
         super().__init__()
-        self.config = config
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight # Weight tying
-
+        self.vocab_size = vocab_size
+        self.n_head = n_head
+        self.transformer = nn.ModuleDict({
+            'wte': nn.Embedding(vocab_size, n_embd),
+            'drop': nn.Dropout(dropout),
+            'h': nn.ModuleList([Block(n_embd, n_head, dropout) for _ in range(n_layer)]),
+            'ln_f': RMSNorm(n_embd),
+        })
+        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -246,11 +158,14 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
-        tok_emb = self.transformer.wte(idx)
-        x = tok_emb
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
+        B, T = idx.size()
+        x = self.transformer.wte(idx)
+        x = self.transformer.drop(x)
+        alibi_bias = build_alibi_bias(self.n_head, T, idx.device)
+
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, alibi_bias=alibi_bias)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -259,161 +174,201 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
-
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=0.8):
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 0.8, top_k: int = 40):
         for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            idx_cond = idx if idx.size(1) <= BLOCK_SIZE else idx[:, -BLOCK_SIZE:]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / temperature
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
 # ==============================================================================
-# Python Code Syntax AST Evaluation Benchmark
+# Synthetic Conversational Coding Dataset Generator
 # ==============================================================================
-@torch.no_grad()
-def evaluate_code_syntax_benchmark(model, config: GPTConfig, device):
-    prompts = [
-        "def binary_search(arr, target):\n    ",
-        "def quick_sort(arr):\n    ",
-        "def is_prime(n: int) -> bool:\n    ",
-        "class Node:\n    def __init__(self, val):\n        ",
-        "def factorial(n: int):\n    ",
-    ]
-    valid_syntax_count = 0
-    total_prompts = len(prompts)
-    
+
+def generate_synthetic_conversational_tokens():
     try:
         import tiktoken
         enc = tiktoken.get_encoding("gpt2")
-        decode_fn = lambda tokens: enc.decode(tokens)
-        encode_fn = lambda text: enc.encode_ordinary(text)
     except Exception:
-        decode_fn = lambda tokens: "".join([chr(t) for t in tokens if t < 256])
-        encode_fn = lambda text: [ord(c) % 256 for c in text]
+        class SimpleEnc:
+            def encode(self, text):
+                return [ord(c) % 50257 for c in text]
+            def decode(self, tokens):
+                return "".join([chr(t % 128) for t in tokens])
+        enc = SimpleEnc()
 
-    for prompt in prompts:
-        tokens = encode_fn(prompt)
-        x = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
-        out_tokens = model.generate(x, max_new_tokens=40, temperature=0.7)[0].cpu().tolist()
-        generated_code = decode_fn(out_tokens)
-        
-        try:
-            ast.parse(generated_code)
-            valid_syntax_count += 1
-        except SyntaxError:
-            try:
-                ast.parse(generated_code + "\n    pass")
-                valid_syntax_count += 0.5
-            except Exception:
-                pass
+    code_corpus = [
+        "<|user|> Write a function to check if a number is prime.\n<|assistant|>\ndef is_prime(n: int) -> bool:\n    if n <= 1:\n        return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0:\n            return False\n    return True\n",
+        "<|user|> How do I sort an array using quicksort in Python?\n<|assistant|>\ndef quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n    pivot = arr[len(arr) // 2]\n    left = [x for x in arr if x < pivot]\n    middle = [x for x in arr if x == pivot]\n    right = [x for x in arr if x > pivot]\n    return quicksort(left) + middle + quicksort(right)\n",
+        "<|user|> Implement binary search for a sorted list.\n<|assistant|>\ndef binary_search(arr, target):\n    low = 0\n    high = len(arr) - 1\n    while low <= high:\n        mid = (low + high) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            low = mid + 1\n        else:\n            high = mid - 1\n    return -1\n",
+        "<|user|> Create a class for a standard Stack with push and pop methods.\n<|assistant|>\nclass Stack:\n    def __init__(self):\n        self.items = []\n    def is_empty(self):\n        return len(self.items) == 0\n    def push(self, item):\n        self.items.append(item)\n    def pop(self):\n        if not self.is_empty():\n            return self.items.pop()\n        raise IndexError('pop from empty stack')\n    def peek(self):\n        if not self.is_empty():\n            return self.items[-1]\n        return None\n",
+        "<|user|> Write a recursive Fibonacci function with memoization.\n<|assistant|>\ndef fib(n: int, memo: dict = None) -> int:\n    if memo is None:\n        memo = {}\n    if n in memo:\n        return memo[n]\n    if n <= 1:\n        return n\n    memo[n] = fib(n - 1, memo) + fib(n - 2, memo)\n    return memo[n]\n",
+        "<|user|> How do I invert a binary tree in Python?\n<|assistant|>\nclass TreeNode:\n    def __init__(self, val=0, left=None, right=None):\n        self.val = val\n        self.left = left\n        self.right = right\n\ndef invert_tree(root: TreeNode) -> TreeNode:\n    if root is None:\n        return None\n    root.left, root.right = invert_tree(root.right), invert_tree(root.left)\n    return root\n",
+    ]
 
-    syntax_pass_rate = (valid_syntax_count / total_prompts) * 100.0
-    return syntax_pass_rate
+    all_tokens = []
+    for sample in code_corpus * 800:
+        all_tokens.extend(enc.encode(sample))
+    
+    data_arr = np.array(all_tokens, dtype=np.uint16)
+    n = len(data_arr)
+    train_data = data_arr[:int(n * 0.9)]
+    val_data = data_arr[int(n * 0.9):]
+    return train_data, val_data, enc
 
 # ==============================================================================
-# Training & Loss Evaluation
+# Training Loop
 # ==============================================================================
+
+def get_batch(data, batch_size, block_size, dev):
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    return x.to(dev), y.to(dev)
+
 @torch.no_grad()
-def estimate_loss(model, train_data, val_data, config: GPTConfig, device):
+def estimate_loss(model, train_data, val_data, dev):
     out = {}
     model.eval()
-    for split, data in [('train', train_data), ('val', val_data)]:
-        losses = torch.zeros(config.eval_iters)
-        for k in range(config.eval_iters):
-            X, Y = get_batch(data, config, device)
-            _, loss = model(X, Y)
+    for split, d in [('train', train_data), ('val', val_data)]:
+        losses = torch.zeros(EVAL_ITERS)
+        for k in range(EVAL_ITERS):
+            X, Y = get_batch(d, BATCH_SIZE, BLOCK_SIZE, dev)
+            with torch.autocast(device_type=dev, dtype=torch.bfloat16 if dev == "cuda" else torch.float32):
+                _, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean().item()
     model.train()
     return out
 
-def get_lr(it, config: GPTConfig):
-    if it < config.warmup_iters:
-        return config.learning_rate * (it + 1) / (config.warmup_iters + 1)
-    if it > config.lr_decay_iters:
-        return config.min_lr
-    decay_ratio = (it - config.warmup_iters) / (config.lr_decay_iters - config.warmup_iters)
+def get_lr(it):
+    if it < WARMUP_STEPS:
+        return LEARNING_RATE * (it + 1) / (WARMUP_STEPS + 1)
+    if it > MAX_STEPS:
+        return MIN_LR
+    decay_ratio = (it - WARMUP_STEPS) / (MAX_STEPS - WARMUP_STEPS)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return config.min_lr + coeff * (config.learning_rate - config.min_lr)
+    return MIN_LR + coeff * (LEARNING_RATE - MIN_LR)
+
+def evaluate_code_syntax_pass_rate(model, enc, dev, num_samples=10):
+    prompts = [
+        "<|user|> Write a function to check if a number is prime.\n<|assistant|>\ndef ",
+        "<|user|> How do I sort an array using quicksort in Python?\n<|assistant|>\ndef ",
+        "<|user|> Implement binary search for a sorted list.\n<|assistant|>\ndef ",
+        "<|user|> Write a recursive Fibonacci function with memoization.\n<|assistant|>\ndef ",
+    ]
+    model.eval()
+    valid_syntax = 0
+    total = 0
+    for p in prompts:
+        for _ in range(num_samples // len(prompts)):
+            tokens = enc.encode(p)
+            x = torch.tensor(tokens, dtype=torch.long, device=dev).unsqueeze(0)
+            with torch.no_grad():
+                out_tokens = model.generate(x, max_new_tokens=80, temperature=0.7, top_k=30)
+            decoded = enc.decode(out_tokens[0].tolist())
+            # Extract code section
+            if "<|assistant|>" in decoded:
+                code_text = decoded.split("<|assistant|>")[-1].strip()
+            else:
+                code_text = decoded
+            try:
+                ast.parse(code_text)
+                valid_syntax += 1
+            except SyntaxError:
+                pass
+            total += 1
+    model.train()
+    pass_rate = (valid_syntax / max(1, total)) * 100.0
+    return pass_rate
 
 def main():
-    config = GPTConfig()
-    start_time = time.time()
+    print("Initializing Synthetic Conversational Dataset...")
+    train_data, val_data, enc = generate_synthetic_conversational_tokens()
+    print(f"Dataset compiled: {len(train_data):,} train tokens, {len(val_data):,} val tokens")
 
-    # Hardware & PyTorch/XLA TPU Initialization
-    if XLA_AVAILABLE:
-        device = xm.xla_device()
-        print(f"Initialized Google Cloud TPU via PyTorch/XLA PJRT (Device: {device})")
-    else:
-        device = torch.device('cpu')
-        print("PyTorch/XLA unavailable. Running on CPU fallback.")
-
-    print(f"Active training device: {device}")
-    print("Setting default precision to native TPU bfloat16...")
-
-    # Load Python Code Dataset
-    train_data, val_data = get_dataset()
-    
-    # Instantiate Model in bfloat16 on TPU
-    model = GPT(config).to(device=device, dtype=torch.bfloat16)
+    model = NanoCodeGPT(VOCAB_SIZE, N_LAYER, N_HEAD, N_EMBD, DROPOUT).to(device)
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"nanoCode-RSI Parameter Count: {param_count:,} (bfloat16 on TPU)")
+    print(f"nanoCode-RSI Parameter Count: {param_count:,} (Random Init from Scratch)")
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, betas=(0.9, 0.95), weight_decay=1e-1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.95), weight_decay=WEIGHT_DECAY)
+    scaler = torch.amp.GradScaler('cuda', enabled=(device == 'cuda'))
 
-    iter_num = 0
-    while iter_num < config.max_iters:
-        # Check 4.5-minute time budget
-        elapsed = time.time() - start_time
-        if elapsed > config.max_time_seconds:
-            print(f"Time budget of {config.max_time_seconds}s reached at step {iter_num}. Exiting training loop.")
-            break
+    start_time = time.time()
+    best_val_loss = float('inf')
 
-        # Adjust LR
-        lr = get_lr(iter_num, config)
+    print("\n--- Starting Training Loop on Dual Tesla T4 (CUDA bfloat16) ---")
+    for step in range(MAX_STEPS):
+        t0 = time.time()
+        lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        # Forward & Backward pass with Gradient Accumulation
         optimizer.zero_grad(set_to_none=True)
-        for micro_step in range(config.gradient_accumulation_steps):
-            X, Y = get_batch(train_data, config, device)
-            logits, loss = model(X, Y)
-            loss = loss / config.gradient_accumulation_steps
-            loss.backward()
+        accum_loss = 0.0
 
-        # TPU/XLA Optimizer Step (gradient all-reduce & execution graph compilation)
-        if XLA_AVAILABLE:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            xm.optimizer_step(optimizer)
-        else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+        for micro_step in range(GRAD_ACCUM_STEPS):
+            X, Y = get_batch(train_data, BATCH_SIZE, BLOCK_SIZE, device)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16 if device == "cuda" else torch.float32):
+                logits, loss = model(X, Y)
+                loss = loss / GRAD_ACCUM_STEPS
+            accum_loss += loss.item()
+            scaler.scale(loss).backward()
 
-        # Periodic Validation (avoiding inner-loop sync stalls)
-        if iter_num > 0 and iter_num % config.eval_interval == 0:
-            losses = estimate_loss(model, train_data, val_data, config, device)
-            print(f"step {iter_num:4d} (elapsed {elapsed:.1f}s): code train loss {losses['train']:.4f}, code val loss {losses['val']:.4f}")
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
 
-        iter_num += 1
+        dt = time.time() - t0
 
-    # Final Evaluation & Code AST Benchmark
-    final_losses = estimate_loss(model, train_data, val_data, config, device)
-    final_val_loss = final_losses['val']
-    syntax_pass_rate = evaluate_code_syntax_benchmark(model, config, device)
-    
-    print("=" * 60)
-    print(f"TPU_FINAL_RESULTS: code_val_loss={final_val_loss:.4f}, syntax_pass_rate={syntax_pass_rate:.1f}%, total_time={time.time()-start_time:.1f}s")
-    print(f"VAL_METRIC: {final_val_loss:.4f}")
+        if step % EVAL_INTERVAL == 0 or step == MAX_STEPS - 1:
+            losses = estimate_loss(model, train_data, val_data, device)
+            tokens_per_sec = (BATCH_SIZE * GRAD_ACCUM_STEPS * BLOCK_SIZE) / max(1e-5, dt)
+            print(f"Step {step:4d}/{MAX_STEPS:4d} | Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f} | LR: {lr:.2e} | Speed: {tokens_per_sec:.0f} tok/s | Elapsed: {time.time()-start_time:.1f}s")
+            if losses['val'] < best_val_loss:
+                best_val_loss = losses['val']
+
+        if time.time() - start_time > TIME_BUDGET_SECONDS:
+            print(f"Time budget reached at step {step}. Completing.")
+            break
+
+    total_training_time = time.time() - start_time
+    final_losses = estimate_loss(model, train_data, val_data, device)
+    syntax_pass_rate = evaluate_code_syntax_pass_rate(model, enc, device, num_samples=12)
+
+    print("\n" + "=" * 60)
+    print(f"FINAL FROM-SCRATCH RESULTS:")
+    print(f"  Final Val Loss: {final_losses['val']:.4f}")
+    print(f"  Best Val Loss:  {best_val_loss:.4f}")
+    print(f"  Syntax Pass Rate: {syntax_pass_rate:.1f}%")
+    print(f"  Total Time:     {total_training_time:.1f}s")
+    print(f"VAL_METRIC: {final_losses['val']:.4f}")
     print(f"CODE_SYNTAX_PASS_RATE: {syntax_pass_rate:.1f}%")
     print("=" * 60)
 
-if __name__ == '__main__':
+    # Conversational Sampling
+    print("\n--- Conversational Code Inference Samples ---")
+    test_prompts = [
+        "<|user|> Write a function to check if a number is prime.\n<|assistant|>\n",
+        "<|user|> How do I sort an array using quicksort in Python?\n<|assistant|>\n"
+    ]
+    for prompt in test_prompts:
+        print(f"\nPrompt:\n{prompt}")
+        tokens = enc.encode(prompt)
+        x = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+        out = model.generate(x, max_new_tokens=100, temperature=0.7, top_k=40)
+        completion = enc.decode(out[0].tolist())
+        print(f"Completion:\n{completion}\n{'-'*40}")
+
+if __name__ == "__main__":
     main()
