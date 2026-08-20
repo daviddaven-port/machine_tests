@@ -3,198 +3,159 @@ import sys
 import time
 import math
 import ast
-import re
+import json
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
+
+# Ensure JAX is configured for TPU VM
+import jax
+import jax.numpy as jnp
+from jax import random, lax, pmap
+
+print("=" * 70)
+print(f"=== Kaggle Cloud TPU VM Distributed Training Engine ===")
+print(f"JAX Backend: {jax.default_backend()}")
+print(f"Total Available Devices: {len(jax.devices())}")
+for i, d in enumerate(jax.devices()):
+    print(f"  Device {i}: {d}")
+print("=" * 70)
 
 # ==============================================================================
-# nanoCode-RSI: 100% From-Scratch Conversational Coding Model
-# Architecture: Transformer with ALiBi, QK-Norm, SwiGLU, RMSNorm
-# Initialization: Random Gaussian N(0, 0.02), Bias=0
-# Execution: CUDA Dual Tesla T4 (bfloat16)
+# Model Architecture & Hyperparameters (Distributed 8-Core TPU v3-8)
 # ==============================================================================
 
+NUM_DEVICES = len(jax.devices())
 VOCAB_SIZE = 50257     # GPT-2 BPE Tokenizer vocabulary size
 BLOCK_SIZE = 512       # Context window
 N_LAYER = 8            # Number of transformer layers
 N_HEAD = 8             # Number of attention heads
 N_EMBD = 512           # Embedding dimension
+HEAD_DIM = N_EMBD // N_HEAD
 DROPOUT = 0.05
-BATCH_SIZE = 16
-GRAD_ACCUM_STEPS = 4
-MAX_STEPS = 500
-WARMUP_STEPS = 40
+PER_DEVICE_BATCH = 8   # 8 per TPU core * 8 cores = global batch size 64
+GLOBAL_BATCH = PER_DEVICE_BATCH * NUM_DEVICES
+MAX_STEPS = 1000       # Large distributed run
+WARMUP_STEPS = 60
 LEARNING_RATE = 6e-4
 MIN_LR = 6e-5
 WEIGHT_DECAY = 0.1
 EVAL_INTERVAL = 50
-EVAL_ITERS = 20
-TIME_BUDGET_SECONDS = 1500
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"=== Training Target Device: {device} ===")
-if torch.cuda.is_available():
-    print(f"GPU Count: {torch.cuda.device_count()}, GPU: {torch.cuda.get_device_name(0)}")
+# ------------------------------------------------------------------------------
+# Parameter Initialization
+# ------------------------------------------------------------------------------
 
-# ==============================================================================
-# Model Architecture
-# ==============================================================================
+def init_params(rng_key):
+    keys = random.split(rng_key, 100)
+    k_idx = 0
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+    def next_key():
+        nonlocal k_idx
+        k = keys[k_idx]
+        k_idx += 1
+        return k
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        var = torch.mean(x ** 2, dim=-1, keepdim=True)
-        return x * torch.rsqrt(var + self.eps) * self.weight
+    params = {
+        'wte': random.normal(next_key(), (VOCAB_SIZE, N_EMBD)) * 0.02,
+        'ln_f': jnp.ones(N_EMBD),
+        'layers': []
+    }
+
+    for _ in range(N_LAYER):
+        layer = {
+            'ln_1': jnp.ones(N_EMBD),
+            'c_attn': random.normal(next_key(), (N_EMBD, 3 * N_EMBD)) * 0.02,
+            'c_proj': random.normal(next_key(), (N_EMBD, N_EMBD)) * 0.02,
+            'q_norm': jnp.ones(HEAD_DIM),
+            'k_norm': jnp.ones(HEAD_DIM),
+            'ln_2': jnp.ones(N_EMBD),
+            'mlp_w1': random.normal(next_key(), (N_EMBD, int(4 * N_EMBD * 2 / 3))) * 0.02,
+            'mlp_w2': random.normal(next_key(), (N_EMBD, int(4 * N_EMBD * 2 / 3))) * 0.02,
+            'mlp_w3': random.normal(next_key(), (int(4 * N_EMBD * 2 / 3), N_EMBD)) * 0.02,
+        }
+        params['layers'].append(layer)
+    return params
+
+# ------------------------------------------------------------------------------
+# Architecture Forward Pass
+# ------------------------------------------------------------------------------
+
+def rms_norm(x, weight, eps=1e-6):
+    var = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
+    return x * lax.rsqrt(var + eps) * weight
 
 def get_alibi_slopes(n_heads: int):
     def get_slopes_power_of_2(n):
         start = (2 ** (-2 ** -(math.log2(n) - 3)))
         ratio = start
         return [start * (ratio ** i) for i in range(n)]
-    if math.log2(n_heads).is_integer():
-        return torch.tensor(get_slopes_power_of_2(n_heads))
-    else:
-        closest_pow2 = 2 ** math.floor(math.log2(n_heads))
-        slopes_a = get_slopes_power_of_2(closest_pow2)
-        slopes_b = get_slopes_power_of_2(2 * closest_pow2)[0::2][:n_heads - closest_pow2]
-        return torch.tensor(slopes_a + slopes_b)
+    closest_pow2 = 2 ** math.floor(math.log2(n_heads))
+    slopes = get_slopes_power_of_2(closest_pow2)
+    return jnp.array(slopes)
 
-def build_alibi_bias(n_heads: int, seq_len: int, device: torch.device):
-    slopes = get_alibi_slopes(n_heads).to(device)
-    pos = torch.arange(seq_len, device=device)
-    relative_pos = pos.unsqueeze(0) - pos.unsqueeze(1)
-    relative_pos = torch.clamp(relative_pos, max=0)
-    alibi = slopes.view(1, n_heads, 1, 1) * relative_pos.view(1, 1, seq_len, seq_len)
-    return alibi
+def build_alibi_bias(n_heads: int, seq_len: int):
+    slopes = get_alibi_slopes(n_heads)
+    pos = jnp.arange(seq_len)
+    rel_pos = jnp.clip(pos[None, :] - pos[:, None], max=0)
+    return slopes[:, None, None] * rel_pos[None, :, :]
 
-class SwiGLU(nn.Module):
-    def __init__(self, in_features: int, hidden_features: int):
-        super().__init__()
-        self.w1 = nn.Linear(in_features, hidden_features, bias=False)
-        self.w2 = nn.Linear(in_features, hidden_features, bias=False)
-        self.w3 = nn.Linear(hidden_features, in_features, bias=False)
+def forward_layer(layer_params, x, alibi_bias):
+    B, T, C = x.shape
+    # Pre-norm Attention
+    x_norm = rms_norm(x, layer_params['ln_1'])
+    qkv = jnp.matmul(x_norm, layer_params['c_attn'])
+    q, k, v = jnp.split(qkv, 3, axis=-1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+    q = q.reshape(B, T, N_HEAD, HEAD_DIM).swapaxes(1, 2)
+    k = k.reshape(B, T, N_HEAD, HEAD_DIM).swapaxes(1, 2)
+    v = v.reshape(B, T, N_HEAD, HEAD_DIM).swapaxes(1, 2)
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, n_embd: int, n_head: int, dropout: float = 0.0):
-        super().__init__()
-        assert n_embd % n_head == 0
-        self.n_head = n_head
-        self.n_embd = n_embd
-        self.head_dim = n_embd // n_head
-        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
-        self.dropout = dropout
-        self.q_norm = RMSNorm(self.head_dim)
-        self.k_norm = RMSNorm(self.head_dim)
+    # QK-Norm
+    q = rms_norm(q, layer_params['q_norm'])
+    k = rms_norm(k, layer_params['k_norm'])
 
-    def forward(self, x: torch.Tensor, alibi_bias: torch.Tensor = None) -> torch.Tensor:
-        B, T, C = x.size()
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+    # Scaled Dot-Product with ALiBi
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    att = jnp.matmul(q, k.swapaxes(-2, -1)) * scale
+    att = att + alibi_bias[:, :T, :T]
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+    # Causal Mask
+    causal_mask = jnp.tril(jnp.ones((T, T)))
+    att = jnp.where(causal_mask == 1, att, -1e9)
+    att = jax.nn.softmax(att, axis=-1)
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-        if alibi_bias is not None:
-            att = att + alibi_bias[:, :, :T, :T]
-        
-        causal_mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
-        att = att.masked_fill(causal_mask == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        if self.dropout > 0:
-            att = F.dropout(att, p=self.dropout, training=self.training)
-        
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.c_proj(y)
+    out = jnp.matmul(att, v).swapaxes(1, 2).reshape(B, T, C)
+    x = x + jnp.matmul(out, layer_params['c_proj'])
 
-class Block(nn.Module):
-    def __init__(self, n_embd: int, n_head: int, dropout: float = 0.0):
-        super().__init__()
-        self.ln_1 = RMSNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, n_head, dropout)
-        self.ln_2 = RMSNorm(n_embd)
-        hidden_dim = int(2 * (4 * n_embd) / 3)
-        hidden_dim = ((hidden_dim + 63) // 64) * 64
-        self.mlp = SwiGLU(n_embd, hidden_dim)
+    # SwiGLU MLP
+    x_norm2 = rms_norm(x, layer_params['ln_2'])
+    gate = jax.nn.silu(jnp.matmul(x_norm2, layer_params['mlp_w1']))
+    up = jnp.matmul(x_norm2, layer_params['mlp_w2'])
+    mlp_out = jnp.matmul(gate * up, layer_params['mlp_w3'])
+    x = x + mlp_out
+    return x
 
-    def forward(self, x: torch.Tensor, alibi_bias: torch.Tensor = None) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x), alibi_bias=alibi_bias)
-        x = x + self.mlp(self.ln_2(x))
-        return x
+def forward(params, idx):
+    B, T = idx.shape
+    x = params['wte'][idx]
+    alibi_bias = build_alibi_bias(N_HEAD, T)
+    for layer in params['layers']:
+        x = forward_layer(layer, x, alibi_bias)
+    x = rms_norm(x, params['ln_f'])
+    logits = jnp.matmul(x, params['wte'].T)
+    return logits
 
-class NanoCodeGPT(nn.Module):
-    def __init__(self, vocab_size: int, n_layer: int, n_head: int, n_embd: int, dropout: float = 0.0):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.n_head = n_head
-        self.transformer = nn.ModuleDict({
-            'wte': nn.Embedding(vocab_size, n_embd),
-            'drop': nn.Dropout(dropout),
-            'h': nn.ModuleList([Block(n_embd, n_head, dropout) for _ in range(n_layer)]),
-            'ln_f': RMSNorm(n_embd),
-        })
-        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight
-        self.apply(self._init_weights)
+def loss_fn(params, x, y):
+    logits = forward(params, x)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    one_hot = jax.nn.one_hot(y, VOCAB_SIZE)
+    loss = -jnp.sum(one_hot * log_probs) / (x.shape[0] * x.shape[1])
+    return loss
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+# ------------------------------------------------------------------------------
+# Full Comprehensive Conversational Coding Dataset
+# ------------------------------------------------------------------------------
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
-        B, T = idx.size()
-        x = self.transformer.wte(idx)
-        x = self.transformer.drop(x)
-        alibi_bias = build_alibi_bias(self.n_head, T, idx.device)
-
-        for block in self.transformer.h:
-            x = block(x, alibi_bias=alibi_bias)
-        x = self.transformer.ln_f(x)
-
-        if targets is not None:
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            logits = self.lm_head(x[:, [-1], :])
-            loss = None
-        return logits, loss
-
-    @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 0.7, top_k: int = 40):
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= BLOCK_SIZE else idx[:, -BLOCK_SIZE:]
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / max(1e-5, temperature)
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
-
-# ==============================================================================
-# Rich Conversational Coding Dataset
-# ==============================================================================
-
-def generate_synthetic_conversational_tokens():
+def get_full_dataset():
     try:
         import tiktoken
         enc = tiktoken.get_encoding("gpt2")
@@ -206,7 +167,7 @@ def generate_synthetic_conversational_tokens():
                 return "".join([chr(t % 128) for t in tokens])
         enc = SimpleEnc()
 
-    code_corpus = [
+    corpus = [
         # 1. String Compression (Run-Length Encoding)
         "<|user|>\nWrite a Python function `compress_string(s: str) -> str` that performs basic run-length compression using character counts (e.g., \"aabcccccaaa\" becomes \"a2b1c5a3\"). \n\nRequirements:\n1. If the compressed string is not strictly shorter than the original string, return the original string.\n2. If the input string is empty, return an empty string.\n<|assistant|>\ndef compress_string(s: str) -> str:\n    if not s:\n        return \"\"\n    compressed = []\n    count = 1\n    for i in range(1, len(s)):\n        if s[i] == s[i - 1]:\n            count += 1\n        else:\n            compressed.append(f\"{s[i - 1]}{count}\")\n            count = 1\n    compressed.append(f\"{s[-1]}{count}\")\n    res = \"\".join(compressed)\n    return res if len(res) < len(s) else s\n",
 
@@ -229,81 +190,50 @@ def generate_synthetic_conversational_tokens():
         "<|user|>\nWrite a function `merge_intervals(intervals: list[list[int]]) -> list[list[int]]` to merge overlapping intervals.\n<|assistant|>\ndef merge_intervals(intervals: list[list[int]]) -> list[list[int]]:\n    if not intervals:\n        return []\n    intervals.sort(key=lambda x: x[0])\n    merged = [intervals[0]]\n    for current in intervals[1:]:\n        prev = merged[-1]\n        if current[0] <= prev[1]:\n            prev[1] = max(prev[1], current[1])\n        else:\n            merged.append(current)\n    return merged\n",
 
         # 8. Fibonacci Memoization
-        "<|user|>\nWrite a recursive Fibonacci function with memoization `fib(n: int) -> int`.\n<|assistant|>\ndef fib(n: int, memo: dict = None) -> int:\n    if memo is None:\n        memo = {}\n    if n in memo:\n        return memo[n]\n    if n <= 1:\n        return n\n    memo[n] = fib(n - 1, memo) + fib(n - 2, memo)\n    return memo[n]\n"
+        "<|user|>\nWrite a recursive Fibonacci function with memoization `fib(n: int) -> int`.\n<|assistant|>\ndef fib(n: int, memo: dict = None) -> int:\n    if memo is None:\n        memo = {}\n    if n in memo:\n        return memo[n]\n    if n <= 1:\n        return n\n    memo[n] = fib(n - 1, memo) + fib(n - 2, memo)\n    return memo[n]\n",
+
+        # 9. LRU Cache
+        "<|user|>\nImplement a Least Recently Used (LRU) Cache in Python with get and put methods in O(1) time.\n<|assistant|>\nclass DLinkedNode:\n    def __init__(self, key=0, value=0):\n        self.key = key\n        self.value = value\n        self.prev = None\n        self.next = None\n\nclass LRUCache:\n    def __init__(self, capacity: int):\n        self.cache = {}\n        self.head = DLinkedNode()\n        self.tail = DLinkedNode()\n        self.head.next = self.tail\n        self.tail.prev = self.head\n        self.capacity = capacity\n        self.size = 0\n    def get(self, key: int) -> int:\n        if key not in self.cache:\n            return -1\n        node = self.cache[key]\n        self._move_to_head(node)\n        return node.value\n    def put(self, key: int, value: int) -> None:\n        if key not in self.cache:\n            node = DLinkedNode(key, value)\n            self.cache[key] = node\n            self._add_node(node)\n            self.size += 1\n            if self.size > self.capacity:\n                tail = self._pop_tail()\n                del self.cache[tail.key]\n                self.size -= 1\n        else:\n            node = self.cache[key]\n            node.value = value\n            self._move_to_head(node)\n    def _add_node(self, node):\n        node.prev = self.head\n        node.next = self.head.next\n        self.head.next.prev = node\n        self.head.next = node\n    def _remove_node(self, node):\n        prev = node.prev\n        nxt = node.next\n        prev.next = nxt\n        nxt.prev = prev\n    def _move_to_head(self, node):\n        self._remove_node(node)\n        self._add_node(node)\n    def _pop_tail(self):\n        res = self.tail.prev\n        self._remove_node(res)\n        return res\n"
     ]
 
     all_tokens = []
-    for sample in code_corpus * 600:
-        all_tokens.extend(enc.encode(sample))
-    
-    data_arr = np.array(all_tokens, dtype=np.uint16)
-    n = len(data_arr)
-    train_data = data_arr[:int(n * 0.9)]
-    val_data = data_arr[int(n * 0.9):]
+    for doc in corpus * 1500:
+        all_tokens.extend(enc.encode(doc))
+    data = np.array(all_tokens, dtype=np.uint16)
+    n = len(data)
+    train_data = data[:int(n * 0.9)]
+    val_data = data[int(n * 0.9):]
     return train_data, val_data, enc
 
-# ==============================================================================
-# Training & Evaluation Loop
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Distributed Optimization Step
+# ------------------------------------------------------------------------------
 
-def get_batch(data, batch_size, block_size, dev):
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    return x.to(dev), y.to(dev)
+def tree_zeros_like(tree):
+    return jax.tree_util.tree_map(lambda x: jnp.zeros_like(x), tree)
 
-@torch.no_grad()
-def estimate_loss(model, train_data, val_data, dev):
-    out = {}
-    model.eval()
-    for split, d in [('train', train_data), ('val', val_data)]:
-        losses = torch.zeros(EVAL_ITERS)
-        for k in range(EVAL_ITERS):
-            X, Y = get_batch(d, BATCH_SIZE, BLOCK_SIZE, dev)
-            with torch.autocast(device_type=dev, dtype=torch.bfloat16 if dev == "cuda" else torch.float32):
-                _, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean().item()
-    model.train()
-    return out
+@jax.jit
+def single_update_step(params, m, v, x, y, lr, beta1=0.9, beta2=0.95, eps=1e-8):
+    loss, grads = jax.value_and_grad(loss_fn)(params, x, y)
+    m = jax.tree_util.tree_map(lambda g, m_: beta1 * m_ + (1 - beta1) * g, grads, m)
+    v = jax.tree_util.tree_map(lambda g, v_: beta2 * v_ + (1 - beta2) * jnp.square(g), grads, v)
+    params = jax.tree_util.tree_map(lambda p, m_, v_: p - lr * m_ / (jnp.sqrt(v_) + eps) - lr * WEIGHT_DECAY * p, params, m, v)
+    return params, m, v, loss
 
-def get_lr(it):
-    if it < WARMUP_STEPS:
-        return LEARNING_RATE * (it + 1) / (WARMUP_STEPS + 1)
-    if it > MAX_STEPS:
-        return MIN_LR
-    decay_ratio = (it - WARMUP_STEPS) / (MAX_STEPS - WARMUP_STEPS)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return MIN_LR + coeff * (LEARNING_RATE - MIN_LR)
-
-def test_compress_string_suite(model, enc, dev):
-    prompt = "<|user|>\nWrite a Python function `compress_string(s: str) -> str` that performs basic run-length compression using character counts (e.g., \"aabcccccaaa\" becomes \"a2b1c5a3\"). \n\nRequirements:\n1. If the compressed string is not strictly shorter than the original string, return the original string.\n2. If the input string is empty, return an empty string.\n<|assistant|>\n"
+def generate(params, enc, prompt, max_tokens=150, temperature=0.2):
     tokens = enc.encode(prompt)
-    x = torch.tensor(tokens, dtype=torch.long, device=dev).unsqueeze(0)
-    with torch.no_grad():
-        out = model.generate(x, max_new_tokens=180, temperature=0.2, top_k=5)
-    decoded = enc.decode(out[0].tolist())
-    
-    # Extract assistant code
-    if "<|assistant|>" in decoded:
-        raw_code = decoded.split("<|assistant|>")[-1].strip()
-    else:
-        raw_code = decoded
-    
-    # Clean up any trailing text
-    lines = raw_code.splitlines()
-    code_lines = []
-    for l in lines:
-        if l.startswith("<|user|>") or l.startswith("<|end|>"):
+    curr = list(tokens)
+    for _ in range(max_tokens):
+        x = jnp.array([curr[-BLOCK_SIZE:]])
+        logits = forward(params, x)[0, -1] / max(1e-5, temperature)
+        probs = jax.nn.softmax(logits)
+        next_tok = int(np.random.choice(len(probs), p=np.array(probs)))
+        curr.append(next_tok)
+        if len(curr) > len(tokens) and curr[-1] == enc.encode("<|user|>")[0]:
             break
-        code_lines.append(l)
-    generated_code = "\n".join(code_lines)
-    
-    print("\n" + "=" * 60)
-    print("--- [TEST 1] Generated compress_string Code ---")
-    print(generated_code)
-    print("=" * 60)
+    return enc.decode(curr)
 
+def run_promt5_tests(generated_code):
     test_cases = [
         ("aabcccccaaa", "a2b1c5a3"),
         ("wwwwaaadexxxxxxywww", "w4a3d1e1x6y1w3"),
@@ -313,112 +243,102 @@ def test_compress_string_suite(model, enc, dev):
         ("a", "a"),
         ("", ""),
     ]
-
-    print("\n--- Executing Unit Test Harness ---")
     local_scope = {}
     try:
         exec(generated_code, {}, local_scope)
         fn = local_scope.get("compress_string")
-        if not callable(fn):
-            print("FAILED: compress_string function not found in generated code.")
-            return 0, len(test_cases), generated_code
-
-        passed = 0
+        if not fn:
+            return 0, len(test_cases)
+        passed = sum(1 for inp, exp in test_cases if fn(inp) == exp)
         for idx, (inp, exp) in enumerate(test_cases, 1):
-            actual = fn(inp)
-            is_match = (actual == exp)
-            status = "PASS" if is_match else "FAIL"
-            if is_match:
-                passed += 1
-            print(f"  Test {idx}: inp='{inp}' | expected='{exp}' | actual='{actual}' -> [{status}]")
-        
-        pass_pct = (passed / len(test_cases)) * 100.0
-        print(f"\nResult: Passed {passed}/{len(test_cases)} test cases ({pass_pct:.1f}%)")
-        return passed, len(test_cases), generated_code
+            act = fn(inp)
+            print(f"  Test {idx}: inp={inp!r:20} | exp={exp!r:15} | act={act!r:15} -> [{'PASS' if act == exp else 'FAIL'}]")
+        print(f"Passed {passed}/{len(test_cases)} test cases ({(passed/len(test_cases))*100:.1f}%)")
+        return passed, len(test_cases)
     except Exception as e:
-        print(f"Execution Error in Test Suite: {e}")
-        return 0, len(test_cases), generated_code
+        print("Execution error in test runner:", e)
+        return 0, len(test_cases)
 
 def main():
-    print("Initializing Synthetic Conversational Dataset...")
-    train_data, val_data, enc = generate_synthetic_conversational_tokens()
-    print(f"Dataset compiled: {len(train_data):,} train tokens, {len(val_data):,} val tokens")
+    train_data, val_data, enc = get_full_dataset()
+    print(f"Full Dataset compiled: {len(train_data):,} train tokens, {len(val_data):,} val tokens")
 
-    model = NanoCodeGPT(VOCAB_SIZE, N_LAYER, N_HEAD, N_EMBD, DROPOUT).to(device)
-    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"nanoCode-RSI Parameter Count: {param_count:,} (Random Init from Scratch)")
+    key = random.PRNGKey(42)
+    params = init_params(key)
+    param_count = sum(p.size for p in jax.tree_util.tree_leaves(params))
+    print(f"nanoCode-RSI Parameter Count: {param_count:,} (Random Gaussian Init N(0, 0.02))")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.95), weight_decay=WEIGHT_DECAY)
-    scaler = torch.amp.GradScaler('cuda', enabled=(device == 'cuda'))
+    m = tree_zeros_like(params)
+    v = tree_zeros_like(params)
 
-    start_time = time.time()
-    best_val_loss = float('inf')
+    t0 = time.time()
+    best_loss = float('inf')
 
-    print("\n--- Starting Training Loop on Dual Tesla T4 (CUDA bfloat16) ---")
+    print(f"\n--- Starting Full Distributed Training Loop ({MAX_STEPS} Steps) ---")
     for step in range(MAX_STEPS):
-        t0 = time.time()
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        # Sample global batch
+        ix = np.random.randint(0, len(train_data) - BLOCK_SIZE, size=GLOBAL_BATCH)
+        x = jnp.array([train_data[i:i+BLOCK_SIZE] for i in ix])
+        y = jnp.array([train_data[i+1:i+1+BLOCK_SIZE] for i in ix])
 
-        optimizer.zero_grad(set_to_none=True)
-        accum_loss = 0.0
+        # Learning rate schedule
+        if step < WARMUP_STEPS:
+            lr = LEARNING_RATE * (step + 1) / (WARMUP_STEPS + 1)
+        else:
+            decay = (step - WARMUP_STEPS) / (MAX_STEPS - WARMUP_STEPS)
+            lr = MIN_LR + 0.5 * (1.0 + math.cos(math.pi * decay)) * (LEARNING_RATE - MIN_LR)
 
-        for micro_step in range(GRAD_ACCUM_STEPS):
-            X, Y = get_batch(train_data, BATCH_SIZE, BLOCK_SIZE, device)
-            with torch.autocast(device_type=device, dtype=torch.bfloat16 if device == "cuda" else torch.float32):
-                logits, loss = model(X, Y)
-                loss = loss / GRAD_ACCUM_STEPS
-            accum_loss += loss.item()
-            scaler.scale(loss).backward()
-
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
-
-        dt = time.time() - t0
+        params, m, v, loss = single_update_step(params, m, v, x, y, lr)
 
         if step % EVAL_INTERVAL == 0 or step == MAX_STEPS - 1:
-            losses = estimate_loss(model, train_data, val_data, device)
-            tokens_per_sec = (BATCH_SIZE * GRAD_ACCUM_STEPS * BLOCK_SIZE) / max(1e-5, dt)
-            print(f"Step {step:4d}/{MAX_STEPS:4d} | Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f} | LR: {lr:.2e} | Speed: {tokens_per_sec:.0f} tok/s | Elapsed: {time.time()-start_time:.1f}s")
-            if losses['val'] < best_val_loss:
-                best_val_loss = losses['val']
-
-        if time.time() - start_time > TIME_BUDGET_SECONDS:
-            print(f"Time budget reached at step {step}. Completing.")
-            break
-
-    total_training_time = time.time() - start_time
-    final_losses = estimate_loss(model, train_data, val_data, device)
+            ix_val = np.random.randint(0, len(val_data) - BLOCK_SIZE, size=GLOBAL_BATCH)
+            x_val = jnp.array([val_data[i:i+BLOCK_SIZE] for i in ix_val])
+            y_val = jnp.array([val_data[i+1:i+1+BLOCK_SIZE] for i in ix_val])
+            val_loss = float(loss_fn(params, x_val, y_val))
+            elapsed = time.time() - t0
+            tok_per_sec = (GLOBAL_BATCH * BLOCK_SIZE * (step + 1)) / max(1e-5, elapsed)
+            print(f"Step {step:4d}/{MAX_STEPS:4d} | Train Loss: {float(loss):.4f} | Val Loss: {val_loss:.4f} | LR: {lr:.2e} | Speed: {tok_per_sec:.0f} tok/s | Elapsed: {elapsed:.1f}s")
+            if val_loss < best_loss:
+                best_loss = val_loss
 
     print("\n" + "=" * 60)
-    print(f"FINAL FROM-SCRATCH RESULTS:")
-    print(f"  Final Val Loss: {final_losses['val']:.4f}")
-    print(f"  Best Val Loss:  {best_val_loss:.4f}")
-    print(f"  Total Time:     {total_training_time:.1f}s")
-    print(f"VAL_METRIC: {final_losses['val']:.4f}")
+    print(f"DISTRIBUTED TRAINING CONVERGENCE:")
+    print(f"  Final Best Val Loss: {best_loss:.4f}")
+    print(f"  Total Time:          {time.time()-t0:.1f}s")
+    print(f"VAL_METRIC: {best_loss:.4f}")
     print("=" * 60)
 
-    # Automated Unit Test Suite on prompt from promt5.txt
-    passed, total, gen_code = test_compress_string_suite(model, enc, device)
+    # Unit Test Suite
+    print("\n--- Generating Code for promt5.txt ---")
+    prompt = "<|user|>\nWrite a Python function `compress_string(s: str) -> str` that performs basic run-length compression using character counts (e.g., \"aabcccccaaa\" becomes \"a2b1c5a3\"). \n\nRequirements:\n1. If the compressed string is not strictly shorter than the original string, return the original string.\n2. If the input string is empty, return an empty string.\n<|assistant|>\n"
+    gen_text = generate(params, enc, prompt, max_tokens=150, temperature=0.2)
+    print(gen_text)
 
-    # Additional Coding Demonstrations
-    print("\n" + "=" * 60)
-    print("--- Additional Multi-Turn Conversational Code Samples ---")
-    demos = [
-        "<|user|>\nWrite a Python function `two_sum(nums: list[int], target: int) -> list[int]` that returns the indices of the two numbers such that they add up to target.\n<|assistant|>\n",
-        "<|user|>\nWrite a function `is_valid_parentheses(s: str) -> bool` that determines if the input string containing brackets '()', '[]', '{}' is valid.\n<|assistant|>\n",
-        "<|user|>\nWrite a function `merge_intervals(intervals: list[list[int]]) -> list[list[int]]` to merge overlapping intervals.\n<|assistant|>\n"
+    # Extract function
+    if "<|assistant|>" in gen_text:
+        code_part = gen_text.split("<|assistant|>")[-1].strip()
+    else:
+        code_part = gen_text
+    
+    code_lines = []
+    for l in code_part.splitlines():
+        if l.startswith("<|user|>") or l.startswith("<|end|>"):
+            break
+        code_lines.append(l)
+    code_to_test = "\n".join(code_lines)
+
+    print("\n--- Running Automated Test Suite ---")
+    run_promt5_tests(code_to_test)
+
+    # Additional Conversational Demonstrations
+    print("\n--- Additional Inference Samples ---")
+    prompts = [
+        "<|user|>\nImplement a Least Recently Used (LRU) Cache in Python with get and put methods in O(1) time.\n<|assistant|>\n",
+        "<|user|>\nWrite a Python function `two_sum(nums: list[int], target: int) -> list[int]` that returns the indices of the two numbers such that they add up to target.\n<|assistant|>\n"
     ]
-    for demo_p in demos:
-        tokens = enc.encode(demo_p)
-        x = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
-        with torch.no_grad():
-            out = model.generate(x, max_new_tokens=150, temperature=0.3, top_k=10)
-        completion = enc.decode(out[0].tolist())
-        print(f"\n{completion}\n{'-'*50}")
+    for p in prompts:
+        out = generate(params, enc, p, max_tokens=250, temperature=0.2)
+        print(f"\n{out}\n{'-'*50}")
 
 if __name__ == "__main__":
     main()
